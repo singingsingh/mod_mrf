@@ -5,6 +5,7 @@
 */
 
 #include "mod_mrf.h"
+#include "receive_context.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,7 +33,6 @@ static apr_array_header_t* tokenize(apr_pool_t *p, const char *s, char sep = '/'
     }
     return arr;
 }
-
 
 // Returns a table read from a file, or NULL and an error message
 static apr_table_t *read_pKVP_from_file(apr_pool_t *pool, const char *fname, char **err_message)
@@ -88,34 +88,32 @@ static char *get_xyzc_size(apr_pool_t *p, struct sz *size, const char *value, co
 
 // Converts a 64bit value into 13 trigesimal chars
 static void uint64tobase32(apr_uint64_t value, char *buffer, int flag = 0) {
-    static char letters[] = "0123456789abcdefghijklmnopqrstuv";
+    static char b32digits[] = "0123456789abcdefghijklmnopqrstuv";
     // From the bottom up
+    buffer[13] = 0; // End of string marker
     for (int i = 0; i < 13; i++, value >>= 5)
-        buffer[12 - i] = letters[value & 0x1f];
+        buffer[12 - i] = b32digits[value & 0x1f];
     buffer[0] |= flag << 4; // empty flag goes in top bit
 }
 
 // Return the value from a base 32 character
 // Returns a negative value if char is not a valid base32 char
 static int b32(unsigned char c) {
+    if (c < '0') return -1;
     if (c - '0' < 10) return c - '0';
-    if (c - 'A' < 32) return c - 'A';
-    if (c - 'a' < 32) return c - 'a';
+    if (c < 'A') return -1;
+    if (c - 'A' < 22) return c - 'A' + 10;
+    if (c < 'a') return -1;
+    if (c - 'a' < 22) return c - 'a' + 10;
     return -1;
 }
 
 static apr_uint64_t base32decode(unsigned char *s, int *flag) {
     apr_int64_t value = 0;
-    if (*s == '"') s++; // Skip initial quotes
-    // first char carries the flag
-    int v = b32(*s++);
-    *flag = v >> 4; // pick up the flag
-    value = v & 0xf; // Only 4 bits
-    for (; *s != 0; s++) {
-        v = b32(*s);
-        if (v < 0) break; // Stop at first non base 32 char
+    while (*s == '"') s++; // Skip initial quotes
+    *flag = (b32(*s) >> 4) & 1; // Pick up the flag from bit 5
+    for (int v = b32(*s++) & 0xf; v >= 0; v = b32(*s++))
         value = (value << 5) + v;
-    }
     return value;
 }
 
@@ -124,7 +122,7 @@ static void mrf_init(apr_pool_t *p, mrf_conf *c) {
     level.width = 1 + (c->size.x - 1) / c->pagesize.x;
     level.height = 1 + (c->size.y - 1) / c->pagesize.y;
     level.offset = 0;
-    // How many levels we have
+    // How many levels do we have
     c->n_levels = 2 + ilogb(max(level.height, level.width) -1);
     c->rsets = (struct rset *)apr_pcalloc(p, sizeof(rset) * c->n_levels);
 
@@ -140,6 +138,24 @@ static void mrf_init(apr_pool_t *p, mrf_conf *c) {
     }
     // MRF has one tile at the top
     ap_assert(c->rsets->height == 1 && c->rsets->width == 1);
+}
+
+// Allow for one or more RegExp guard
+// If present, at least one of them has to match the URL
+static const char *set_regexp(cmd_parms *cmd, mrf_conf *c, const char *pattern)
+{
+    char *err_message = NULL;
+    if (c->regexp == 0)
+        c->regexp = apr_array_make(cmd->pool, 2, sizeof(ap_regex_t));
+    ap_regex_t *m = (ap_regex_t *)apr_array_push(c->regexp);
+    int error = ap_regcomp(m, pattern, 0);
+    if (error) {
+        int msize = 2048;
+        err_message = (char *)apr_pcalloc(cmd->pool, msize);
+        ap_regerror(error, m, err_message, msize);
+        return apr_pstrcat(cmd->pool, "MRF Regexp incorrect ", err_message, NULL);
+    }
+    return NULL;
 }
 
 /*
@@ -255,37 +271,29 @@ static const char *mrf_file_set(cmd_parms *cmd, void *dconf, const char *arg)
     // If an emtpy tile is not provided, it falls through
     // If provided, it has an optional size and offset followed by file name which defaults to datafile
     // read the empty tile
-    const char *efname = c->datafname;
+   const char *efname = c->datafname; // Default file name is data file
     line = apr_table_get(kvp, "EmptyTile");
     if (line) {
         char *last;
+        // Try to read a figure first
         c->esize = apr_strtoi64(line, &last, 0);
-        // Might be an offset, or offset then file name
-        if (last != line) 
+
+        // If that worked, try to get an offset too
+        if (last != line)
             apr_strtoff(&(c->eoffset), last, &last, 0);
-        // If there is anything left, it's the file name
+
+        // If there is anything left
+        while (*last && isspace(*last)) last++;
         if (*last != 0)
             efname = last;
     }
 
-    // Allow for one or more RegExp guard
-    // One of them has to match if the request is to be considered
-    line = apr_table_get(kvp, "RegExp");
-    if (line) {
-        if (c->regexp == 0)
-            c->regexp = apr_array_make(cmd->pool, 2, sizeof(ap_regex_t));
-        ap_regex_t *m = (ap_regex_t *)apr_array_push(c->regexp);
-        int error = ap_regcomp(m, line, 0);
-        if (error) {
-            int msize = 2048;
-            char *message = (char *)apr_pcalloc(cmd->pool, msize);
-            ap_regerror(error, m, message, msize);
-            return apr_psprintf(cmd->pool, "MRF Regexp failed for %s %s", line, message);
-        }
-    }
+    line = apr_table_get(kvp, "Redirect");
+    if (line)
+        c->redirect = apr_pstrdup(cmd->pool, line);
 
     // If we're provided a file name or a size, pre-read the empty tile in the 
-    if (apr_strnatcmp(efname, c->datafname) || c->esize) {
+    if (c->datafname && (apr_strnatcmp(efname, c->datafname) || c->esize)) {
         apr_file_t *efile;
         apr_off_t offset = c->eoffset;
         apr_status_t stat;
@@ -318,12 +326,19 @@ static const char *mrf_file_set(cmd_parms *cmd, void *dconf, const char *arg)
     // Ignore the flag
     int flag;
     c->seed = line ? base32decode((unsigned char *)line, &flag) : 0;
+    // Set the missing tile etag, with the extra bit set
+    uint64tobase32(c->seed, c->eETag, 1);
     c->enabled = 1;
     return NULL;
 }
 
-static int send_image(request_rec *r, apr_uint32_t *buffer, apr_size_t size) {
-    // TODO: Send the image
+static int etag_matches(request_rec *r, const char *ETag) {
+    const char *ETagIn = apr_table_get(r->headers_in, "If-None-Match");
+    return ETagIn != 0 && strstr(ETagIn, ETag);
+}
+
+static int send_image(request_rec *r, apr_uint32_t *buffer, apr_size_t size)
+{
     mrf_conf *cfg = (mrf_conf *)ap_get_module_config(r->per_dir_config, &mrf_module);
     if (cfg->mime_type)
         ap_set_content_type(r, cfg->mime_type);
@@ -351,6 +366,11 @@ static int send_image(request_rec *r, apr_uint32_t *buffer, apr_size_t size) {
 // Returns the empty tile if defined
 static int send_empty_tile(request_rec *r) {
     mrf_conf *cfg = (mrf_conf *)ap_get_module_config(r->per_dir_config, &mrf_module);
+    if (etag_matches(r, cfg->eETag)) {
+        apr_table_setn(r->headers_out, "ETag", cfg->eETag);
+        return HTTP_NOT_MODIFIED;
+    }
+
     if (!cfg->empty) return DECLINED;
     return send_image(r, cfg->empty, cfg->esize);
 }
@@ -403,20 +423,21 @@ static int handler(request_rec *r)
     // Need at least three numerical arguments
     tile.x = apr_atoi64(*(char **)apr_array_pop(tokens)); REQ_ERR_IF(errno);
     tile.y = apr_atoi64(*(char **)apr_array_pop(tokens)); REQ_ERR_IF(errno);
-    tile.c = apr_atoi64(*(char **)apr_array_pop(tokens)); REQ_ERR_IF(errno);
+    tile.l = apr_atoi64(*(char **)apr_array_pop(tokens)); REQ_ERR_IF(errno);
 
     // We can ignore the error on this one, defaults to zero
-    if (tokens->nelts)
+    // The parameter before the level can't start with a digit for an extra-dimensional MRF
+    if (cfg->size.z != 1 && tokens->nelts)
         tile.z = apr_atoi64(*(char **)apr_array_pop(tokens));
 
-    // Don't allow access to levels less than zero
-    if (tile.c < 0)
+    // Don't allow access to levels less than zero, send the empty tile instead
+    if (tile.l < 0)
         return send_empty_tile(r);
 
-    tile.c += cfg->skip_levels;
+    tile.l += cfg->skip_levels;
     // Check for bad requests, outside of the defined bounds
-    REQ_ERR_IF(tile.c > cfg->n_levels);
-    rset *level = cfg->rsets + tile.c;
+    REQ_ERR_IF(tile.l > cfg->n_levels);
+    rset *level = cfg->rsets + tile.l;
     REQ_ERR_IF(tile.x >= level->width || tile.y >= level->height);
 
     // Offset of the index entry for this tile
@@ -426,8 +447,6 @@ static int handler(request_rec *r)
     apr_file_t *idxf, *dataf;
     SERR_IF(open_file(r, &idxf, cfg->idxfname),
         apr_psprintf(r->pool, "Can't open %s", cfg->idxfname));
-    SERR_IF(open_file(r, &dataf, cfg->datafname),
-        apr_psprintf(r->pool, "Can't open %s", cfg->datafname));
     SERR_IF(apr_file_seek(idxf, APR_SET, &tidx_offset), 
         apr_psprintf(r->pool, "Tile doesn't exist in %s", cfg->datafname));
     TIdx index;
@@ -447,18 +466,66 @@ static int handler(request_rec *r)
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    // TODO: Check ETag conditional
+    // Check for conditional ETag here, no need to open the data file
+    char *ETag = (char *)apr_palloc(r->pool, 16);
+    // Try to distribute the bits a bit to generate an ETag
+    uint64tobase32(cfg->seed ^ (index.size << 40) ^ index.offset, ETag);
+    if (etag_matches(r, ETag)) {
+        apr_table_setn(r->headers_out, "ETag", ETag);
+        return HTTP_NOT_MODIFIED;
+    }
 
-    // We got the tile index, and is not empty
-    apr_uint32_t *buffer = (apr_uint32_t *) apr_palloc(r->pool, index.size);
-    SERR_IF(!buffer,
-        "Memory allocation error in mod_mrf");
-    SERR_IF(apr_file_seek(dataf, APR_SET, (apr_off_t *)&index.offset),
-        apr_psprintf(r->pool, "Seek error in %s", cfg->datafname));
-    read_size = index.size;
-    SERR_IF(apr_file_read(dataf, buffer, &read_size) || read_size != index.size,
-        apr_psprintf(r->pool, "Can't read from %s", cfg->datafname));
-    return send_image(r, buffer, read_size);
+    // Now for the data part
+    if (!cfg->datafname && !cfg->redirect)
+        SERR_IF(true, apr_psprintf(r->pool, "No data file configured for %s", r->uri));
+
+    apr_uint32_t *buffer = (apr_uint32_t *)apr_palloc(r->pool, index.size);
+
+    if (cfg->redirect) {
+        // TODO: S3 authorized requests
+        ap_filter_rec_t *receive_filter = ap_get_output_filter_handle("Receive");
+        SERR_IF(!receive_filter, "Redirect needs mod_receive to be available");
+
+        // Get a buffer for the received image
+        receive_ctx rctx;
+        rctx.buffer = (char *)buffer;
+        rctx.maxsize = index.size;
+        rctx.size = 0;
+
+        ap_filter_t *rf = ap_add_output_filter_handle(receive_filter, &rctx, r, r->connection);
+        request_rec *sr = ap_sub_req_lookup_uri(cfg->redirect, r, r->output_filters);
+
+        // Data file is on a remote site a range request redirect with a range header
+        static const char *rfmt = "bytes=%" APR_UINT64_T_FMT "-%" APR_UINT64_T_FMT;
+        char *Range = apr_psprintf(r->pool, rfmt, index.offset, index.offset + index.size);
+        apr_table_setn(sr->headers_in, "Range", Range);
+        int status = ap_run_sub_req(sr);
+        ap_remove_output_filter(rf);
+
+        if (status != APR_SUCCESS || sr->status != HTTP_PARTIAL_CONTENT || rctx.size != index.size) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Can't fetch data from %s", cfg->redirect);
+            return HTTP_SERVICE_UNAVAILABLE;
+        }
+        apr_table_clear(r->headers_out);
+    }
+    else
+    { // Read from a local file
+        SERR_IF(open_file(r, &dataf, cfg->datafname),
+            apr_psprintf(r->pool, "Can't open %s", cfg->datafname));
+
+        // We got the tile index, and is not empty
+        SERR_IF(!buffer,
+            "Memory allocation error in mod_mrf");
+        SERR_IF(apr_file_seek(dataf, APR_SET, (apr_off_t *)&index.offset),
+            apr_psprintf(r->pool, "Seek error in %s", cfg->datafname));
+        read_size = index.size;
+        SERR_IF(apr_file_read(dataf, buffer, &read_size) || read_size != index.size,
+            apr_psprintf(r->pool, "Can't read from %s", cfg->datafname));
+    }
+
+    // Looks fine, set the outgoing etag and then the image
+    apr_table_setn(r->headers_out, "ETag", ETag);
+    return send_image(r, buffer, index.size);
 }
 
 static const command_rec mrf_cmds[] =
@@ -478,6 +545,13 @@ static const command_rec mrf_cmds[] =
         ACCESS_CONF, // availability
         "The configuration file for this module"
     ),
+
+    AP_INIT_TAKE1(
+    "MRF_RegExp",
+    (cmd_func)set_regexp,
+    0, // Self-pass argument
+    ACCESS_CONF, // availability
+    "Regular expression that the URL has to match.  At least one is required."),
 
     { NULL }
 };

@@ -12,6 +12,7 @@
 #include <http_core.h>
 #include <http_request.h>
 #include <http_log.h>
+#include <cctype>
 
 #include <apr_strings.h>
 
@@ -58,7 +59,7 @@ APLOG_USE_MODULE(mrf);
 #endif
 
 struct sz {
-    apr_int64_t x, y, z, c;
+    apr_int64_t x, y, z, c, l;
 };
 
 struct rset {
@@ -93,8 +94,9 @@ typedef struct {
     int n_levels;
     struct rset *rsets;
 
-    // Empty tile, if provided
+    // Empty tile buffer, if provided
     apr_uint32_t *empty;
+    // Size of empty tile, in bytes
     apr_int64_t esize;
     apr_off_t eoffset;
 
@@ -103,6 +105,10 @@ typedef struct {
 
     // ETag initializer
     apr_uint64_t seed;
+    // Buffer for the emtpy tile etag
+    char eETag[16];
+    // The internal redirect path or null
+    char *redirect;
 
 } mrf_conf;
 
